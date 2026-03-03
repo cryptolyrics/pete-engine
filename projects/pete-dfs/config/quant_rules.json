@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "min_edge_pct": 0.03,
   "min_model_prob": 0.52,
   "max_single_bet_decimal_odds": 3.0,
