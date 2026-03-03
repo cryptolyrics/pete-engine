@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "min_edge_pct": 0.03,
+  "min_model_prob": 0.52,
+  "max_single_bet_decimal_odds": 3.0,
+  "max_parlay_legs": 3
+}

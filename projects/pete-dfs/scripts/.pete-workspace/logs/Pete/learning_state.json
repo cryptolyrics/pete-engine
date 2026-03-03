@@ -1,0 +1,45 @@
+{
+  "player_adjustments": {},
+  "team_adjustments": {},
+  "player_prop_adjustments": {},
+  "player_prop_opp_adjustments": {},
+  "prop_market_stats": {
+    "PTS": {
+      "over_hits": 1,
+      "over_misses": 1,
+      "under_hits": 1,
+      "under_misses": 1
+    },
+    "REB": {
+      "over_hits": 1,
+      "over_misses": 1,
+      "under_hits": 1,
+      "under_misses": 1
+    },
+    "AST": {
+      "over_hits": 1,
+      "over_misses": 1,
+      "under_hits": 1,
+      "under_misses": 1
+    },
+    "STL": {
+      "over_hits": 1,
+      "over_misses": 1,
+      "under_hits": 1,
+      "under_misses": 1
+    },
+    "3PM": {
+      "over_hits": 1,
+      "over_misses": 1,
+      "under_hits": 1,
+      "under_misses": 1
+    }
+  },
+  "meta": {
+    "dfs_samples": 0,
+    "bet_samples": 0,
+    "prop_samples": 0,
+    "updated_at": "2026-03-03T09:30:11",
+    "last_feedback_file": ""
+  }
+}
