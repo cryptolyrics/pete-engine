@@ -29,6 +29,7 @@ except Exception:
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={yyyymmdd}"
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={event_id}"
+TANK01_INJURY_ENDPOINT = "https://tank01-fantasy-stats.p.rapidapi.com/getNBAInjuryList"
 
 ROSTER_SLOTS = {"PG": 2, "SG": 2, "SF": 2, "PF": 2, "C": 1}
 DEFAULT_SALARY_CAP = 100_000
@@ -36,6 +37,13 @@ WORKSPACE = Path(os.environ.get("OPENCLAW_WORKSPACE", str(Path.cwd() / ".pete-wo
 LOG_DIR = WORKSPACE / "logs" / "Pete"
 DEFAULT_TANK01_PROPS_WEIGHT = 0.20
 DEFAULT_TANK01_PROPS_CAP = 8.0
+DEFAULT_INJURY_TEAMMATE_OUT_WEIGHT = 1.9
+DEFAULT_INJURY_TEAMMATE_Q_WEIGHT = 0.7
+DEFAULT_INJURY_OPP_OUT_WEIGHT = 0.9
+DEFAULT_INJURY_OPPORTUNITY_CAP = 8.0
+DEFAULT_TEAM_LAST4_WINDOW_GAMES = 4
+DEFAULT_TEAM_LAST4_WEIGHT = 0.35
+DEFAULT_TEAM_LAST4_CAP = 4.0
 
 INJURY_OUT_TAGS = {"out", "doubtful", "inactive", "ruled out"}
 INJURY_QUESTIONABLE_TAGS = {"questionable", "gtd", "game time decision"}
@@ -107,6 +115,8 @@ class EngineResult:
     scrape: dict
     injury_summary: Optional[dict] = None
     h2h_summary: Optional[dict] = None
+    injury_opportunity_summary: Optional[dict] = None
+    team_last4_summary: Optional[dict] = None
     tank01_summary: Optional[dict] = None
     value_summary: Optional[dict] = None
     tank01_backtest: Optional[dict] = None
@@ -566,6 +576,38 @@ def load_tank01_props_index(run_date: str, data_root: Path, max_lag_days: int = 
         "players_with_props": len(by_player_id),
         "by_player_id": by_player_id,
     }
+
+
+def refresh_tank01_injuries_snapshot(run_date: str, data_root: Path, timeout_s: int = 25) -> dict:
+    api_key = os.environ.get("TANK01_RAPIDAPI_KEY") or os.environ.get("RAPIDAPI_KEY") or ""
+    if not api_key:
+        return {"ok": False, "error": "missing_rapidapi_key", "path": ""}
+
+    headers = {
+        "x-rapidapi-host": "tank01-fantasy-stats.p.rapidapi.com",
+        "x-rapidapi-key": api_key,
+    }
+    try:
+        response = requests.get(TANK01_INJURY_ENDPOINT, headers=headers, timeout=timeout_s)
+    except Exception as exc:
+        return {"ok": False, "error": f"request_failed:{exc}", "path": ""}
+
+    if response.status_code != 200:
+        return {"ok": False, "error": f"http_{response.status_code}", "path": ""}
+
+    try:
+        payload = response.json()
+    except Exception:
+        return {"ok": False, "error": "invalid_json", "path": ""}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "unexpected_payload", "path": ""}
+
+    target = data_root / "nba" / "injuries" / f"{run_date}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    body = payload.get("body", [])
+    records = len(body) if isinstance(body, list) else 0
+    return {"ok": True, "path": str(target), "records": int(records)}
 
 
 def load_tank01_injury_index(run_date: str, data_root: Path, max_lag_days: int = 2) -> dict:
@@ -1188,6 +1230,200 @@ def apply_h2h_adjustments(
     return work, summary
 
 
+def build_team_injury_pressure_scores(
+    injury_index: dict,
+    out_weight: float = DEFAULT_INJURY_TEAMMATE_OUT_WEIGHT,
+    questionable_weight: float = DEFAULT_INJURY_TEAMMATE_Q_WEIGHT,
+) -> dict:
+    counts: Dict[str, dict] = {}
+    for row in injury_index.get("records", {}).values():
+        if not isinstance(row, dict):
+            continue
+        team = normalize_team_code(row.get("team", ""))
+        if not team:
+            continue
+        category = str(row.get("category", "available")).strip().lower()
+        bucket = counts.setdefault(team, {"out": 0, "questionable": 0})
+        if category == "out":
+            bucket["out"] += 1
+        elif category == "questionable":
+            bucket["questionable"] += 1
+
+    scores = {}
+    for team, bucket in counts.items():
+        score = (float(bucket.get("out", 0)) * out_weight) + (float(bucket.get("questionable", 0)) * questionable_weight)
+        if score > 0.0:
+            scores[team] = round(score, 4)
+    return {"scores": scores, "counts": counts}
+
+
+def load_team_last4_form_scores(
+    schedule_rows: List[dict],
+    run_date: str,
+    data_root: Path,
+    game_cache: Optional[Dict[str, List[dict]]] = None,
+    window_games: int = DEFAULT_TEAM_LAST4_WINDOW_GAMES,
+) -> dict:
+    cache = game_cache if game_cache is not None else {}
+    completed_games = [
+        row
+        for row in schedule_rows
+        if row.get("game_date", "") < run_date and int(row.get("status_num") or 0) >= 2
+    ]
+    completed_games.sort(key=lambda row: (row.get("game_date", ""), row.get("game_id", "")), reverse=True)
+
+    by_team: Dict[str, List[dict]] = {}
+    for game in completed_games:
+        rows = _load_game_boxscore_rows(game.get("game_id", ""), data_root, cache)
+        if not rows:
+            continue
+        totals: Dict[str, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            team = normalize_team_code(row.get("team", ""))
+            if not team:
+                continue
+            totals[team] = totals.get(team, 0.0) + _h2h_fp(row)
+        for team, total in totals.items():
+            by_team.setdefault(team, []).append({"game_date": game.get("game_date", ""), "fp": float(total)})
+
+    avg_fp: Dict[str, float] = {}
+    samples: Dict[str, int] = {}
+    for team, rows in by_team.items():
+        rows.sort(key=lambda row: row.get("game_date", ""), reverse=True)
+        window = rows[: max(1, int(window_games))]
+        if not window:
+            continue
+        avg_fp[team] = float(np.mean([row.get("fp", 0.0) for row in window]))
+        samples[team] = len(window)
+
+    if not avg_fp:
+        return {"scores": {}, "delta_fp": {}, "avg_fp": {}, "samples": {}, "league_avg_fp": 0.0, "window_games": int(window_games)}
+
+    league_avg = float(np.mean(list(avg_fp.values())))
+    score_map = {}
+    delta_map = {}
+    for team, team_avg in avg_fp.items():
+        delta = team_avg - league_avg
+        delta_map[team] = round(delta, 4)
+        score_map[team] = round(max(-0.35, min(0.35, delta / max(1.0, league_avg))), 6)
+
+    return {
+        "scores": score_map,
+        "delta_fp": delta_map,
+        "avg_fp": avg_fp,
+        "samples": samples,
+        "league_avg_fp": round(league_avg, 4),
+        "window_games": int(window_games),
+    }
+
+
+def apply_team_last4_adjustments(
+    df: pd.DataFrame,
+    last4_form: dict,
+    weight: float = DEFAULT_TEAM_LAST4_WEIGHT,
+    cap_abs: float = DEFAULT_TEAM_LAST4_CAP,
+) -> Tuple[pd.DataFrame, dict]:
+    if df.empty:
+        return df, {"players_adjusted": 0, "teams_scored": 0}
+
+    work = df.copy()
+    work["TeamLast4Adj"] = 0.0
+    work["TeamLast4Score"] = 0.0
+    work["TeamLast4Games"] = 0
+
+    scores = last4_form.get("scores", {}) if isinstance(last4_form, dict) else {}
+    deltas = last4_form.get("delta_fp", {}) if isinstance(last4_form, dict) else {}
+    samples = last4_form.get("samples", {}) if isinstance(last4_form, dict) else {}
+    adjusted = 0
+    for idx, row in work.iterrows():
+        team = normalize_team_code(row.get("Team", ""))
+        delta = float(deltas.get(team, 0.0))
+        score = float(scores.get(team, 0.0))
+        games = int(samples.get(team, 0))
+        adj = max(-cap_abs, min(cap_abs, delta * weight))
+        if abs(adj) > 0.0:
+            adjusted += 1
+        work.at[idx, "TeamLast4Adj"] = round(adj, 4)
+        work.at[idx, "TeamLast4Score"] = round(score, 6)
+        work.at[idx, "TeamLast4Games"] = games
+
+    summary = {
+        "players_adjusted": int(adjusted),
+        "teams_scored": int(len(scores)),
+        "league_avg_fp": float(last4_form.get("league_avg_fp", 0.0)),
+        "window_games": int(last4_form.get("window_games", 4)),
+    }
+    return work, summary
+
+
+def apply_injury_opportunity_adjustments(
+    df: pd.DataFrame,
+    opponents: Dict[str, str],
+    injury_index: dict,
+    teammate_out_weight: float = DEFAULT_INJURY_TEAMMATE_OUT_WEIGHT,
+    teammate_questionable_weight: float = DEFAULT_INJURY_TEAMMATE_Q_WEIGHT,
+    opponent_out_weight: float = DEFAULT_INJURY_OPP_OUT_WEIGHT,
+    cap_abs: float = DEFAULT_INJURY_OPPORTUNITY_CAP,
+) -> Tuple[pd.DataFrame, dict]:
+    if df.empty:
+        return df, {"players_adjusted": 0, "teams_with_pressure": 0}
+
+    work = df.copy()
+    pressure = build_team_injury_pressure_scores(
+        injury_index,
+        out_weight=teammate_out_weight,
+        questionable_weight=teammate_questionable_weight,
+    )
+    pressure_scores = pressure.get("scores", {})
+
+    work["InjuryOpportunityAdj"] = 0.0
+    work["InjuryPressureTeam"] = 0.0
+    work["InjuryPressureOpp"] = 0.0
+    work["InjuryRoleClass"] = "core"
+    adjusted = 0
+
+    team_salary_median = work.groupby("Team")["Salary"].median().to_dict() if "Salary" in work.columns else {}
+    team_form_median = work.groupby("Team")["Form"].median().to_dict() if "Form" in work.columns else {}
+
+    for idx, row in work.iterrows():
+        team = normalize_team_code(row.get("Team", ""))
+        opponent = normalize_team_code(opponents.get(team, ""))
+        team_pressure = float(pressure_scores.get(team, 0.0))
+        opp_pressure = float(pressure_scores.get(opponent, 0.0))
+        salary = _safe_float(row.get("Salary"), 0.0)
+        form = _safe_float(row.get("Form"), 0.0)
+        salary_cut = _safe_float(team_salary_median.get(team), salary)
+        form_cut = _safe_float(team_form_median.get(team), form)
+        is_secondary = salary <= salary_cut or form <= form_cut
+
+        teammate_boost = team_pressure * (1.35 if is_secondary else 0.90)
+        opponent_boost = opp_pressure * opponent_out_weight
+        merged_status = str(row.get("Merged Status", "available")).strip().lower()
+        own_health_factor = 1.0
+        if merged_status == "questionable":
+            own_health_factor = 0.35
+        elif merged_status == "probable":
+            own_health_factor = 0.75
+
+        adj = max(-cap_abs, min(cap_abs, (teammate_boost + opponent_boost) * own_health_factor))
+        if abs(adj) > 0.0:
+            adjusted += 1
+
+        work.at[idx, "InjuryOpportunityAdj"] = round(adj, 4)
+        work.at[idx, "InjuryPressureTeam"] = round(team_pressure, 4)
+        work.at[idx, "InjuryPressureOpp"] = round(opp_pressure, 4)
+        work.at[idx, "InjuryRoleClass"] = "secondary" if is_secondary else "core"
+
+    summary = {
+        "players_adjusted": int(adjusted),
+        "teams_with_pressure": int(len(pressure_scores)),
+        "pressure_scores": pressure_scores,
+    }
+    return work, summary
+
+
 def _canonical_column_map(columns: Iterable[str]) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     for raw in columns:
@@ -1326,6 +1562,8 @@ def build_mission_control_payload(
                 "h2h_adjustment": _safe_float(row.get("H2HAdj"), 0.0),
                 "tank01_prop_adjustment": _safe_float(row.get("Tank01PropAdj"), 0.0),
                 "tank01_prop_fp": _safe_float(row.get("Tank01PropFP"), 0.0),
+                "team_last4_adjustment": _safe_float(row.get("TeamLast4Adj"), 0.0),
+                "injury_opportunity_adjustment": _safe_float(row.get("InjuryOpportunityAdj"), 0.0),
                 "injury_penalty": _safe_float(row.get("InjuryPenalty"), 0.0),
                 "final_projection": _safe_float(row.get("SelectedProjection"), _safe_float(row.get("Form"), 0.0)),
                 "h2h_samples": int(_safe_float(row.get("H2HSamples"), 0.0)),
@@ -1376,6 +1614,8 @@ def build_mission_control_payload(
         },
         "injury_source_summary": result.injury_summary or {},
         "h2h_summary": result.h2h_summary or {},
+        "injury_opportunity_summary": result.injury_opportunity_summary or {},
+        "team_last4_summary": result.team_last4_summary or {},
         "tank01_summary": result.tank01_summary or {},
         "tank01_backtest": result.tank01_backtest or {},
         "value_detection": result.value_summary or {},
@@ -1511,6 +1751,7 @@ def run_pete_dfs_engine(
     espn_injuries_json: str = "",
     data_root: str = "",
     refresh_injuries: bool = False,
+    refresh_tank01_injuries: bool = False,
     h2h_weight: float = 0.25,
     h2h_cap_abs: float = 8.0,
     h2h_min_samples: int = 3,
@@ -1519,6 +1760,13 @@ def run_pete_dfs_engine(
     tank01_props_cap_abs: float = DEFAULT_TANK01_PROPS_CAP,
     tank01_backtest_days: int = 21,
     tank01_max_lag_days: int = 2,
+    injury_teammate_out_weight: float = DEFAULT_INJURY_TEAMMATE_OUT_WEIGHT,
+    injury_teammate_questionable_weight: float = DEFAULT_INJURY_TEAMMATE_Q_WEIGHT,
+    injury_opponent_out_weight: float = DEFAULT_INJURY_OPP_OUT_WEIGHT,
+    injury_opportunity_cap_abs: float = DEFAULT_INJURY_OPPORTUNITY_CAP,
+    team_last4_window_games: int = DEFAULT_TEAM_LAST4_WINDOW_GAMES,
+    team_last4_weight: float = DEFAULT_TEAM_LAST4_WEIGHT,
+    team_last4_cap_abs: float = DEFAULT_TEAM_LAST4_CAP,
 ) -> EngineResult:
     print(f"PETE DFS ENGINE: processing {daily_csv_path}")
     print(f"Collecting ESPN history over last {lookback_days} days...")
@@ -1541,6 +1789,15 @@ def run_pete_dfs_engine(
         cap_abs=max(0.0, tank01_props_cap_abs),
     )
 
+    tank01_refresh_status = {
+        "ok": False,
+        "path": str(root / "nba" / "injuries" / f"{run_date}.json"),
+        "skipped": True,
+    }
+    if refresh_tank01_injuries:
+        tank01_refresh_status = refresh_tank01_injuries_snapshot(run_date, root)
+        tank01_refresh_status["skipped"] = False
+
     tank01_injury_index = load_tank01_injury_index(run_date, root, max_lag_days=max(0, tank01_max_lag_days))
     tank01_backtest = run_tank01_props_backtest(root, lookback_days=max(1, tank01_backtest_days))
     tank01_summary = {
@@ -1549,6 +1806,7 @@ def run_pete_dfs_engine(
         "injuries": {
             "source": tank01_injury_index.get("source", ""),
             "records": int(tank01_injury_index.get("count", 0)),
+            "refresh": tank01_refresh_status,
         },
     }
 
@@ -1575,16 +1833,46 @@ def run_pete_dfs_engine(
         min_samples=max(1, h2h_min_samples),
     )
 
+    schedule_rows = load_schedule_rows(root)
+    opponents = build_today_opponent_map(schedule_rows, run_date)
+    last4_form = load_team_last4_form_scores(
+        schedule_rows,
+        run_date,
+        root,
+        window_games=max(1, team_last4_window_games),
+    )
+    df, team_last4_summary = apply_team_last4_adjustments(
+        df,
+        last4_form,
+        weight=team_last4_weight,
+        cap_abs=team_last4_cap_abs,
+    )
+    df, injury_opportunity_summary = apply_injury_opportunity_adjustments(
+        df,
+        opponents,
+        tank01_injury_index,
+        teammate_out_weight=injury_teammate_out_weight,
+        teammate_questionable_weight=injury_teammate_questionable_weight,
+        opponent_out_weight=injury_opponent_out_weight,
+        cap_abs=injury_opportunity_cap_abs,
+    )
+
     if "H2HAdj" not in df.columns:
         df["H2HAdj"] = 0.0
     if "InjuryPenalty" not in df.columns:
         df["InjuryPenalty"] = 0.0
     if "Tank01PropAdj" not in df.columns:
         df["Tank01PropAdj"] = 0.0
+    if "TeamLast4Adj" not in df.columns:
+        df["TeamLast4Adj"] = 0.0
+    if "InjuryOpportunityAdj" not in df.columns:
+        df["InjuryOpportunityAdj"] = 0.0
     df["AdjForm"] = (
         df["Form"].astype(float)
         + df["H2HAdj"].astype(float)
         + df["Tank01PropAdj"].astype(float)
+        + df["TeamLast4Adj"].astype(float)
+        + df["InjuryOpportunityAdj"].astype(float)
         - df["InjuryPenalty"].astype(float)
     )
     value_summary = build_value_detection_summary(df)
@@ -1602,6 +1890,8 @@ def run_pete_dfs_engine(
             scrape=scrape,
             injury_summary=injury_summary,
             h2h_summary=h2h_summary,
+            injury_opportunity_summary=injury_opportunity_summary,
+            team_last4_summary=team_last4_summary,
             tank01_summary=tank01_summary,
             value_summary=value_summary,
             tank01_backtest=tank01_backtest,
@@ -1621,6 +1911,8 @@ def run_pete_dfs_engine(
         "Form",
         "H2HAdj",
         "Tank01PropAdj",
+        "TeamLast4Adj",
+        "InjuryOpportunityAdj",
         "InjuryPenalty",
         "SelectedProjection",
         "RiskStd",
@@ -1636,6 +1928,8 @@ def run_pete_dfs_engine(
     print(f"Scrape: {scrape}")
     print(f"Injury Summary: {injury_summary}")
     print(f"H2H Summary: {h2h_summary}")
+    print(f"Injury Opportunity Summary: {injury_opportunity_summary}")
+    print(f"Team Last4 Summary: {team_last4_summary}")
     print(f"Tank01 Summary: {tank01_summary}")
     print(f"Tank01 Backtest: {tank01_backtest}")
     print(f"Value Detection: {value_summary}")
@@ -1650,6 +1944,8 @@ def run_pete_dfs_engine(
         scrape=scrape,
         injury_summary=injury_summary,
         h2h_summary=h2h_summary,
+        injury_opportunity_summary=injury_opportunity_summary,
+        team_last4_summary=team_last4_summary,
         tank01_summary=tank01_summary,
         value_summary=value_summary,
         tank01_backtest=tank01_backtest,
@@ -1673,6 +1969,12 @@ def main() -> None:
         help="Refresh ESPN injury feed before optimization (default: false; CSV remains source-of-truth)",
     )
     parser.add_argument(
+        "--tank01-refresh-injuries",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Refresh Tank01 injury snapshot before optimization (default: false)",
+    )
+    parser.add_argument(
         "--data-root",
         default=str(Path.cwd() / "projects" / "pete-dfs" / "data-lake"),
         help="Local data-lake root for H2H lookups",
@@ -1685,6 +1987,48 @@ def main() -> None:
     parser.add_argument("--tank01-props-cap-abs", type=float, default=DEFAULT_TANK01_PROPS_CAP, help="Absolute cap for Tank01 props adjustment points")
     parser.add_argument("--tank01-backtest-days", type=int, default=21, help="How many recent Tank01 prop dates to include in backtest summary")
     parser.add_argument("--tank01-max-lag-days", type=int, default=2, help="Max file-date lag to accept for Tank01 dated snapshots")
+    parser.add_argument(
+        "--injury-teammate-out-weight",
+        type=float,
+        default=DEFAULT_INJURY_TEAMMATE_OUT_WEIGHT,
+        help="Per-teammate-out boost for injury opportunity adjustment",
+    )
+    parser.add_argument(
+        "--injury-teammate-questionable-weight",
+        type=float,
+        default=DEFAULT_INJURY_TEAMMATE_Q_WEIGHT,
+        help="Per-teammate-questionable boost for injury opportunity adjustment",
+    )
+    parser.add_argument(
+        "--injury-opponent-out-weight",
+        type=float,
+        default=DEFAULT_INJURY_OPP_OUT_WEIGHT,
+        help="Per-opponent-out boost for injury opportunity adjustment",
+    )
+    parser.add_argument(
+        "--injury-opportunity-cap-abs",
+        type=float,
+        default=DEFAULT_INJURY_OPPORTUNITY_CAP,
+        help="Absolute cap for injury opportunity adjustment points",
+    )
+    parser.add_argument(
+        "--team-last4-window-games",
+        type=int,
+        default=DEFAULT_TEAM_LAST4_WINDOW_GAMES,
+        help="Window size (games) for team last-4 form input",
+    )
+    parser.add_argument(
+        "--team-last4-weight",
+        type=float,
+        default=DEFAULT_TEAM_LAST4_WEIGHT,
+        help="Weight for team last-4 form adjustment blending",
+    )
+    parser.add_argument(
+        "--team-last4-cap-abs",
+        type=float,
+        default=DEFAULT_TEAM_LAST4_CAP,
+        help="Absolute cap for team last-4 form adjustment points",
+    )
     parser.add_argument(
         "--mission-control-json",
         default="",
@@ -1702,6 +2046,7 @@ def main() -> None:
         espn_injuries_json=args.espn_injuries_json,
         data_root=args.data_root,
         refresh_injuries=bool(args.refresh_espn_injuries),
+        refresh_tank01_injuries=bool(args.tank01_refresh_injuries),
         h2h_weight=max(0.0, args.h2h_weight),
         h2h_cap_abs=max(0.0, args.h2h_cap_abs),
         h2h_min_samples=max(1, args.h2h_min_samples),
@@ -1710,6 +2055,13 @@ def main() -> None:
         tank01_props_cap_abs=max(0.0, args.tank01_props_cap_abs),
         tank01_backtest_days=max(1, args.tank01_backtest_days),
         tank01_max_lag_days=max(0, args.tank01_max_lag_days),
+        injury_teammate_out_weight=max(0.0, args.injury_teammate_out_weight),
+        injury_teammate_questionable_weight=max(0.0, args.injury_teammate_questionable_weight),
+        injury_opponent_out_weight=max(0.0, args.injury_opponent_out_weight),
+        injury_opportunity_cap_abs=max(0.0, args.injury_opportunity_cap_abs),
+        team_last4_window_games=max(1, args.team_last4_window_games),
+        team_last4_weight=max(0.0, args.team_last4_weight),
+        team_last4_cap_abs=max(0.0, args.team_last4_cap_abs),
     )
 
     lineup_rows = result.lineup if result.success else []
