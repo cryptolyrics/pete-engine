@@ -63,6 +63,13 @@ TANK01_TEAM_ALIASES = {
 }
 
 
+TANK01_BASE_URL = "https://tank01-fantasy-stats.p.rapidapi.com"
+TANK01_HOST = "tank01-fantasy-stats.p.rapidapi.com"
+TANK01_DEFAULT_TIMEOUT = int(os.environ.get("TANK01_TIMEOUT", "30"))
+INJURY_OUT_TAGS = {"out", "doubtful", "inactive", "ruled out", "suspended"}
+INJURY_QUESTIONABLE_TAGS = {"questionable", "gtd", "game time decision"}
+INJURY_PROBABLE_TAGS = {"probable"}
+
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
@@ -103,6 +110,83 @@ def load_env_secrets() -> str:
     return os.environ.get("NBA_API_KEY", "")
 
 
+
+
+def tank01_api_key() -> str:
+    return os.environ.get("TANK01_RAPIDAPI_KEY") or os.environ.get("RAPIDAPI_KEY") or ""
+
+
+def tank01_get(endpoint: str, params: Optional[dict] = None, timeout_s: Optional[int] = None) -> dict:
+    api_key = tank01_api_key()
+    if not api_key:
+        return {"body": [], "errors": {"auth": "TANK01_RAPIDAPI_KEY missing"}}
+
+    url = f"{TANK01_BASE_URL}/{endpoint.lstrip('/')}"
+    headers = {
+        "x-rapidapi-host": TANK01_HOST,
+        "x-rapidapi-key": api_key,
+        "Accept": "application/json",
+    }
+    try:
+        response = requests.get(url, headers=headers, params=params or {}, timeout=timeout_s or TANK01_DEFAULT_TIMEOUT)
+        if response.status_code != 200:
+            return {
+                "body": [],
+                "errors": {"http": f"status={response.status_code}", "body": response.text[:500]},
+            }
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+        return {"body": payload}
+    except Exception as exc:
+        return {"body": [], "errors": {"exception": str(exc)}}
+
+
+def _tank01_body_list(payload: dict) -> list:
+    if not isinstance(payload, dict):
+        return []
+    body = payload.get("body", payload.get("response", []))
+    if isinstance(body, list):
+        return body
+    return []
+
+
+def _save_tank01_snapshot(payload: dict, data_root: str, category: str, run_date: str) -> Path:
+    root = Path(data_root) / "nba" / category
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{run_date}.json"
+    if isinstance(payload, dict) and "body" in payload:
+        snapshot = payload
+    else:
+        snapshot = {"body": payload}
+    snapshot.setdefault("meta", {})
+    snapshot["meta"].update({"source": "tank01-live", "fetched_at": datetime.now().isoformat(timespec="seconds")})
+    target.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    return target
+
+
+def classify_injury_status(status_text: str) -> str:
+    text = str(status_text or "").strip().lower()
+    if not text:
+        return "available"
+    if any(tag in text for tag in INJURY_OUT_TAGS):
+        return "out"
+    if any(tag in text for tag in INJURY_QUESTIONABLE_TAGS):
+        return "questionable"
+    if any(tag in text for tag in INJURY_PROBABLE_TAGS):
+        return "probable"
+    return "available"
+
+
+def _canonical_player_name(value: str) -> str:
+    text = str(value or "").lower()
+    text = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text)
+    text = " ".join(text.split())
+    for suffix in (" jr", " sr", " ii", " iii", " iv", " v"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+    return text
+
 def api_sports_get(path: str, params: dict) -> dict:
     api_key = os.environ.get("NBA_API_KEY", "")
     if not api_key:
@@ -129,6 +213,111 @@ def api_sports_get(path: str, params: dict) -> dict:
     except Exception as exc:
         return {"response": [], "errors": {"exception": str(exc)}}
 
+
+
+
+def refresh_tank01_snapshots(run_date: str, data_root: str, season: str) -> dict:
+    status = {"ok": True, "errors": {}, "paths": {}}
+
+    def _fetch(endpoint: str, params: dict, category: str):
+        payload = tank01_get(endpoint, params=params)
+        if payload.get("errors"):
+            status["ok"] = False
+            status["errors"][endpoint] = payload.get("errors")
+        path = _save_tank01_snapshot(payload, data_root, category, run_date)
+        status["paths"][category] = str(path)
+        return payload
+
+    _fetch("getNBAPlayerList", {}, "players")
+    _fetch("getNBABettingOdds", {"gameDate": _dash_to_compact_date(run_date)}, "betting-props")
+    _fetch("getNBAInjuryList", {}, "injuries")
+    _fetch("getNBADFS", {"slate": "main"}, "dfs")
+    _fetch("getNBATeams", {}, "teams")
+    _fetch("getNBAScoresOnly", {"gameDate": _dash_to_compact_date(run_date)}, "scores")
+    _fetch("getNBAProjections", {"numDays": 7}, "projections")
+    return status
+
+
+def load_tank01_dfs_pool(run_date: str, data_root: str, max_lag_days: int = 2) -> dict:
+    source_path, lag_days = _resolve_dated_json(Path(data_root) / "nba" / "dfs", run_date, max_lag_days)
+    if source_path is None:
+        return {"players": [], "source": "", "source_lag_days": -1}
+    payload = _load_json(source_path)
+    rows = _tank01_body_list(payload)
+    return {"players": rows, "source": str(source_path), "source_lag_days": int(lag_days)}
+
+
+def load_tank01_projections(run_date: str, data_root: str, max_lag_days: int = 2) -> dict:
+    source_path, lag_days = _resolve_dated_json(Path(data_root) / "nba" / "projections", run_date, max_lag_days)
+    if source_path is None:
+        return {"rows": [], "source": "", "source_lag_days": -1}
+    payload = _load_json(source_path)
+    rows = _tank01_body_list(payload)
+    return {"rows": rows, "source": str(source_path), "source_lag_days": int(lag_days)}
+
+
+def build_projection_map_from_tank01(rows: list) -> dict:
+    projection = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid = str(row.get("playerID") or row.get("playerId") or row.get("player_id") or "").strip()
+        name = str(row.get("longName") or row.get("playerName") or row.get("name") or "").strip()
+        raw_fp = row.get("fantasyPoints") or row.get("fantasyPointsTotal") or row.get("FP") or row.get("FPTS")
+        fp = safe_float(raw_fp, 0.0)
+        if fp <= 0:
+            fp = (
+                safe_float(row.get("pts"), 0.0) * POINTS_WEIGHT
+                + safe_float(row.get("reb"), 0.0) * REBOUNDS_WEIGHT
+                + safe_float(row.get("ast"), 0.0) * ASSISTS_WEIGHT
+                + safe_float(row.get("stl"), 0.0) * STEALS_WEIGHT
+                + safe_float(row.get("blk"), 0.0) * BLOCKS_WEIGHT
+                + safe_float(row.get("tov"), 0.0) * TURNOVERS_WEIGHT
+            )
+        if fp <= 0:
+            continue
+        if pid:
+            projection[pid] = fp
+        if name:
+            projection[_canonical_player_name(name)] = fp
+    return projection
+
+
+def load_tank01_injury_status_map(run_date: str, data_root: str, max_lag_days: int = 2) -> dict:
+    source_path, lag_days = _resolve_dated_json(Path(data_root) / "nba" / "injuries", run_date, max_lag_days)
+    if source_path is None:
+        return {"by_name": {}, "source": "", "source_lag_days": -1}
+    payload = _load_json(source_path)
+    rows = []
+    _collect_tank01_dicts(payload.get("body", payload), rows)
+    status = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("longName") or row.get("playerName") or row.get("player") or "").strip()
+        if not name:
+            continue
+        status_text = row.get("injuryStatus") or row.get("status") or row.get("injury") or ""
+        status[_canonical_player_name(name)] = classify_injury_status(status_text)
+    return {"by_name": status, "source": str(source_path), "source_lag_days": int(lag_days)}
+
+
+def load_tank01_scores(run_date: str, data_root: str, max_lag_days: int = 2) -> dict:
+    source_path, lag_days = _resolve_dated_json(Path(data_root) / "nba" / "scores", run_date, max_lag_days)
+    if source_path is None:
+        return {"rows": [], "source": "", "source_lag_days": -1}
+    payload = _load_json(source_path)
+    rows = _tank01_body_list(payload)
+    return {"rows": rows, "source": str(source_path), "source_lag_days": int(lag_days)}
+
+
+def load_tank01_teams(run_date: str, data_root: str, max_lag_days: int = 2) -> dict:
+    source_path, lag_days = _resolve_dated_json(Path(data_root) / "nba" / "teams", run_date, max_lag_days)
+    if source_path is None:
+        return {"rows": [], "source": "", "source_lag_days": -1}
+    payload = _load_json(source_path)
+    rows = _tank01_body_list(payload)
+    return {"rows": rows, "source": str(source_path), "source_lag_days": int(lag_days)}
 
 def _response_list(payload: dict) -> list:
     values = payload.get("response", [])
@@ -1232,6 +1421,90 @@ def load_draftstars_players(csv_path: str, slot: str, learning_state: dict) -> L
     return _draftstars_slot_filter(rows, slot)
 
 
+
+
+def load_tank01_dfs_players(
+    run_date: str,
+    data_root: str,
+    slot: str,
+    learning_state: dict,
+    max_lag_days: int = 2,
+    projections_rows: Optional[list] = None,
+    injury_status: Optional[dict] = None,
+) -> Tuple[List[dict], int]:
+    dfs_payload = load_tank01_dfs_pool(run_date, data_root, max_lag_days=max_lag_days)
+    rows = dfs_payload.get("players", []) if isinstance(dfs_payload, dict) else []
+    if not rows:
+        return [], DEFAULT_SALARY_CAP
+
+    projection_map = build_projection_map_from_tank01(projections_rows or [])
+    injury_map = injury_status or {}
+    player_adj = learning_state.get("player_adjustments", {}) if isinstance(learning_state, dict) else {}
+
+    players: List[dict] = []
+    max_salary = 0
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("longName") or raw.get("playerName") or raw.get("name") or "").strip()
+        if not name:
+            continue
+        status_text = raw.get("injuryStatus") or raw.get("status") or ""
+        status = classify_injury_status(status_text)
+        if status in {"out", "doubtful"}:
+            continue
+        if injury_map.get(_canonical_player_name(name)) in {"out", "doubtful"}:
+            continue
+
+        salary = int(safe_float(raw.get("salary") or raw.get("Salary"), 0.0))
+        if salary <= 0:
+            continue
+        max_salary = max(max_salary, salary)
+        positions_raw = raw.get("position") or raw.get("pos") or raw.get("Position") or ""
+        positions = _split_positions(str(positions_raw))
+        if not positions:
+            continue
+
+        fppg = safe_float(raw.get("fppg") or raw.get("FPPG") or raw.get("avgFP") or raw.get("avgFantasyPoints"), 0.0)
+        form = safe_float(raw.get("form") or raw.get("Form"), fppg)
+
+        pid = str(raw.get("playerID") or raw.get("playerId") or raw.get("player_id") or "").strip()
+        proj_fp = 0.0
+        if pid and pid in projection_map:
+            proj_fp = projection_map.get(pid, 0.0)
+        if not proj_fp:
+            proj_fp = projection_map.get(_canonical_player_name(name), 0.0)
+        if proj_fp > 0:
+            form = proj_fp
+
+        adjustment = safe_float(player_adj.get(name, 0.0), 0.0)
+        projected = (0.65 * form) + (0.35 * fppg) + adjustment
+        projected = round(max(projected, 0.0), 3)
+
+        start_raw = raw.get("Start") or raw.get("startTime") or raw.get("start") or ""
+        start_dt = _parse_time(start_raw)
+        team = str(raw.get("team") or raw.get("teamAbv") or raw.get("Team") or "").strip()
+
+        players.append(
+            {
+                "name": name,
+                "team": team,
+                "positions": positions,
+                "salary": salary,
+                "fppg": round(fppg, 3),
+                "form": round(form, 3),
+                "projected": projected,
+                "value_score": round((projected / salary) * 1000.0, 4),
+                "start_dt": start_dt,
+            }
+        )
+
+    salary_cap = DEFAULT_SALARY_CAP
+    if max_salary and max_salary <= 12000:
+        salary_cap = 50000
+
+    return _draftstars_slot_filter(players, slot), salary_cap
+
 def _lineup_optimizer(players: List[dict], salary_cap: int = 100000) -> List[dict]:
     slot_order = ["PG", "PG", "SG", "SG", "SF", "SF", "PF", "PF", "C"]
 
@@ -1331,8 +1604,14 @@ def build_best_lineup(
     slot: str = "all",
     learning_state: Optional[dict] = None,
     rules: Optional[dict] = None,
+    run_date: Optional[str] = None,
+    tank01_data_root: Optional[str] = None,
+    tank01_max_lag_days: int = 2,
+    tank01_projections_rows: Optional[list] = None,
+    tank01_injury_map: Optional[dict] = None,
+    use_tank01_dfs: bool = False,
 ) -> dict:
-    if not draftstars_csv:
+    if not draftstars_csv and not use_tank01_dfs:
         return {
             "lineup": [],
             "format": "draftstars-classic",
@@ -1340,17 +1619,32 @@ def build_best_lineup(
             "projected_points": 0,
             "smokies": [],
             "projection_map": {},
-            "note": "No Draftstars CSV supplied. Pass --draftstars-csv to build lineup.",
+            "note": "No Draftstars CSV supplied. Pass --draftstars-csv or enable Tank01 DFS feed.",
         }
 
     state = learning_state or load_learning_state()
     quant_rules = rules or load_quant_rules()
 
-    players = load_draftstars_players(draftstars_csv, slot, state)
+    salary_cap = DEFAULT_SALARY_CAP
+    if draftstars_csv:
+        players = load_draftstars_players(draftstars_csv, slot, state)
+        format_name = "draftstars-classic"
+    else:
+        players, salary_cap = load_tank01_dfs_players(
+            run_date=str(run_date or TODAY),
+            data_root=str(tank01_data_root or Path.cwd() / "projects" / "pete-dfs" / "data-lake"),
+            slot=slot,
+            learning_state=state,
+            max_lag_days=max(0, tank01_max_lag_days),
+            projections_rows=tank01_projections_rows,
+            injury_status=(tank01_injury_map or {}).get("by_name", {}),
+        )
+        format_name = "tank01-dfs"
+
     if not players:
         return {
             "lineup": [],
-            "format": "draftstars-classic",
+            "format": format_name,
             "total_salary": 0,
             "projected_points": 0,
             "smokies": [],
@@ -1358,7 +1652,7 @@ def build_best_lineup(
             "note": "No eligible players after filtering.",
         }
 
-    lineup = _lineup_optimizer(players)
+    lineup = _lineup_optimizer(players, salary_cap=salary_cap)
     smokies = find_smokies(players, quant_rules)
 
     if not lineup:
@@ -1388,7 +1682,7 @@ def build_best_lineup(
 
     return {
         "lineup": lineup_rows,
-        "format": "draftstars-classic-2-2-2-2-1",
+        "format": f"{format_name}-2-2-2-2-1",
         "total_salary": total_salary,
         "projected_points": round(projected_points, 3),
         "smokies": smokies,
@@ -1748,6 +2042,135 @@ def build_learning_summary(learning_state: dict) -> dict:
         "top_prop_adjustments": [{"player_market": k, "adj": round(safe_float(v), 4)} for k, v in top_prop],
     }
 
+
+
+
+def write_run_snapshot(run_date: str, payload: dict) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / f"{run_date}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def load_run_snapshot(run_date: str) -> dict:
+    path = LOG_DIR / f"{run_date}.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _extract_scores_results(rows: list) -> dict:
+    results = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        home = normalize_team_code(row.get("homeTeam") or row.get("home") or row.get("homeTeamAbv") or "")
+        away = normalize_team_code(row.get("awayTeam") or row.get("away") or row.get("awayTeamAbv") or "")
+        if not home or not away:
+            continue
+        home_score = safe_float(row.get("homeScore") or row.get("homePts") or row.get("homePoints"), math.nan)
+        away_score = safe_float(row.get("awayScore") or row.get("awayPts") or row.get("awayPoints"), math.nan)
+        if math.isnan(home_score) or math.isnan(away_score):
+            continue
+        winner = home if home_score > away_score else away
+        results[(home, away)] = winner
+        results[(away, home)] = winner
+    return results
+
+
+def _tank01_game_log_actuals(payload: dict, target_date: str) -> Optional[dict]:
+    rows = _tank01_body_list(payload)
+    if not rows:
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date_raw = str(row.get("gameDate") or row.get("date") or row.get("game_date") or "").strip()
+        date_raw = _compact_to_dash_date(date_raw)
+        if date_raw != target_date:
+            continue
+        stats = {
+            "pts": safe_float(row.get("pts") or row.get("points"), 0.0),
+            "reb": safe_float(row.get("reb") or row.get("rebounds"), 0.0),
+            "ast": safe_float(row.get("ast") or row.get("assists"), 0.0),
+            "stl": safe_float(row.get("stl") or row.get("steals"), 0.0),
+            "blk": safe_float(row.get("blk") or row.get("blocks"), 0.0),
+            "tov": safe_float(row.get("tov") or row.get("turnovers"), 0.0),
+            "3pm": safe_float(row.get("threePM") or row.get("3PM") or row.get("threes"), 0.0),
+        }
+        fp = (
+            stats["pts"] * POINTS_WEIGHT
+            + stats["reb"] * REBOUNDS_WEIGHT
+            + stats["ast"] * ASSISTS_WEIGHT
+            + stats["stl"] * STEALS_WEIGHT
+            + stats["blk"] * BLOCKS_WEIGHT
+            + stats["tov"] * TURNOVERS_WEIGHT
+        )
+        return {"fp": fp, **stats}
+    return None
+
+
+def build_tank01_feedback(run_date: str, data_root: str) -> Optional[Path]:
+    snapshot = load_run_snapshot(run_date)
+    if not snapshot:
+        return None
+
+    projection_map = snapshot.get("projection_map", {}) if isinstance(snapshot.get("projection_map"), dict) else {}
+    bet_pick = snapshot.get("bet", {}) if isinstance(snapshot.get("bet"), dict) else {}
+
+    players_index = load_tank01_players_index(run_date, data_root, max_lag_days=3)
+    if not players_index.get("by_id") and tank01_api_key():
+        payload = tank01_get("getNBAPlayerList", {})
+        _save_tank01_snapshot(payload, data_root, "players", run_date)
+        players_index = load_tank01_players_index(run_date, data_root, max_lag_days=3)
+    name_to_id = {}
+    for pid, meta in players_index.get("by_id", {}).items():
+        name = _canonical_player_name(meta.get("name", ""))
+        if name:
+            name_to_id[name] = pid
+
+    dfs_samples = []
+    for name, projected in projection_map.items():
+        canonical = _canonical_player_name(name)
+        pid = name_to_id.get(canonical)
+        if not pid:
+            continue
+        payload = tank01_get("getNBAGamesForPlayer", {"playerID": pid})
+        actual = _tank01_game_log_actuals(payload, run_date)
+        if not actual:
+            continue
+        dfs_samples.append({"player": name, "projected_fp": projected, "actual_fp": round(actual["fp"], 4)})
+
+    scores = load_tank01_scores(run_date, data_root, max_lag_days=3)
+    if not scores.get("rows") and tank01_api_key():
+        payload = tank01_get("getNBAScoresOnly", {"gameDate": _dash_to_compact_date(run_date)})
+        _save_tank01_snapshot(payload, data_root, "scores", run_date)
+        scores = load_tank01_scores(run_date, data_root, max_lag_days=3)
+    score_rows = scores.get("rows", []) if isinstance(scores, dict) else []
+    winners = _extract_scores_results(score_rows)
+    bet_samples = []
+    pick = str(bet_pick.get("pick", "")).strip()
+    if pick and pick != "NO_BET":
+        home = normalize_team_code(pick)
+        won = None
+        for (team_a, team_b), winner in winners.items():
+            if home in {team_a, team_b}:
+                won = winner == home
+                break
+        if won is not None:
+            bet_samples.append({"team": pick, "model_prob": bet_pick.get("model_prob", 0.5), "won": won})
+
+    payload = {"dfs": dfs_samples, "bets": bet_samples, "props": []}
+    if not dfs_samples and not bet_samples:
+        return None
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / f"feedback-{run_date}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 def build_prop_game_context(odds_data: dict) -> dict:
     context = {}
@@ -2713,9 +3136,18 @@ def main() -> None:
     if not api_key and (not args.tank01_enable or args.api_sports_fallback):
         print("[Pete NBA] WARNING: NBA_API_KEY not set; API-Sports fallback is unavailable")
 
+    tank01_refresh = None
+    if args.tank01_enable and tank01_api_key():
+        tank01_refresh = refresh_tank01_snapshots(args.date, args.tank01_data_root, args.season)
+
     rules = load_quant_rules()
     learning_state = load_learning_state()
     learning_state = update_learning_state_from_feedback(learning_state, args.feedback_json)
+    if args.tank01_enable and tank01_api_key():
+        learning_date = (datetime.strptime(args.date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        feedback_path = build_tank01_feedback(learning_date, args.tank01_data_root)
+        if feedback_path:
+            learning_state = update_learning_state_from_feedback(learning_state, str(feedback_path))
     save_learning_state(learning_state)
 
     games_data, odds_for_wagering, source_summary = resolve_market_feeds(
@@ -2759,12 +3191,21 @@ def main() -> None:
     major_out_espn = load_espn_major_out_teams(args.espn_injuries_json) if not major_out_tank01 else set()
     major_out_teams = set(major_out_manual) | set(major_out_tank01) | set(major_out_espn)
 
+    tank01_projections = load_tank01_projections(args.date, args.tank01_data_root, max_lag_days=max(0, args.tank01_max_lag_days))
+    tank01_injuries = load_tank01_injury_status_map(args.date, args.tank01_data_root, max_lag_days=max(0, args.tank01_max_lag_days))
+
     lineup = build_best_lineup(
         games_data,
         draftstars_csv=args.draftstars_csv,
         slot=args.slot,
         learning_state=learning_state,
         rules=rules,
+        run_date=args.date,
+        tank01_data_root=args.tank01_data_root,
+        tank01_max_lag_days=max(0, args.tank01_max_lag_days),
+        tank01_projections_rows=tank01_projections.get("rows", []),
+        tank01_injury_map=tank01_injuries,
+        use_tank01_dfs=bool(args.tank01_enable and not args.draftstars_csv),
     )
     pivots = get_pivots(lineup)
     parlay = build_parlay(
@@ -2826,6 +3267,18 @@ def main() -> None:
         data_source_summary=source_summary,
         b2b_reference_date=previous_date,
     )
+
+    run_snapshot = {
+        "run_date": args.date,
+        "slot": args.slot,
+        "projection_map": lineup.get("projection_map", {}),
+        "lineup": lineup.get("lineup", []),
+        "bet": bet,
+        "parlay": parlay,
+        "prop_parlay": prop_parlay,
+        "tank01_refresh": tank01_refresh or {},
+    }
+    write_run_snapshot(args.date, run_snapshot)
 
     report += (
         "\n## Tank01 Integration\n"

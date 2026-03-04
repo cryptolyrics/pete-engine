@@ -1,0 +1,6 @@
+.pete-workspace/
+INPUTS/
+OUTPUTS/
+projects/pete-dfs/data-lake/
+*.log
+.DS_Store
