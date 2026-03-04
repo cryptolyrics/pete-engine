@@ -37,6 +37,7 @@ WORKSPACE = Path(os.environ.get("OPENCLAW_WORKSPACE", str(Path.cwd() / ".pete-wo
 LOG_DIR = WORKSPACE / "logs" / "Pete"
 TODAY = datetime.now().strftime("%Y-%m-%d")
 DEFAULT_SEASON = str(datetime.now().year)
+DEFAULT_SALARY_CAP = 50000  # Standard NBA DFS salary cap
 NBA_API_BASE_URL = os.environ.get("NBA_API_BASE_URL", "https://v2.nba.api-sports.io").rstrip("/")
 NBA_API_TIMEOUT = int(os.environ.get("NBA_API_TIMEOUT", "30"))
 TANK01_MARKET_MAP = {
