@@ -1469,6 +1469,17 @@ def load_and_clean_daily_csv(daily_csv_path: str) -> pd.DataFrame:
     cleaned["Playing Status"] = cleaned["Playing Status"].astype(str)
     cleaned["Team"] = cleaned["Team"].astype(str).map(normalize_team_code)
 
+    # Deduplicate: keep first occurrence (or highest Form)
+    if not cleaned.empty and "Name" in cleaned.columns:
+        # Create a key for dedup: name + team
+        cleaned["_dedup_key"] = cleaned["Name"].astype(str).str.strip() + "::" + cleaned["Team"].astype(str)
+        # Sort by Form descending, then drop duplicates keeping first
+        if "Form" in cleaned.columns:
+            cleaned = cleaned.sort_values("Form", ascending=False).drop_duplicates(subset=["_dedup_key"], keep="first")
+        else:
+            cleaned = cleaned.drop_duplicates(subset=["_dedup_key"], keep="first")
+        cleaned = cleaned.drop(columns=["_dedup_key"]).reset_index(drop=True)
+
     return cleaned.reset_index(drop=True)
 
 
