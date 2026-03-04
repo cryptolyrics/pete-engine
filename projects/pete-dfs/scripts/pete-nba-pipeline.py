@@ -1371,10 +1371,10 @@ def _draftstars_slot_filter(players: List[dict], slot: str) -> List[dict]:
     return [p for p in players if p.get("start_dt") is None or p["start_dt"] > pivot]
 
 
-def load_draftstars_players(csv_path: str, slot: str, learning_state: dict) -> List[dict]:
+def load_draftstars_players(csv_path: str, slot: str, learning_state: dict) -> Tuple[List[dict], int]:
     path = Path(csv_path)
     if not path.exists():
-        return []
+        return [], 100000
 
     rows: List[dict] = []
     player_adj = learning_state.get("player_adjustments", {}) if isinstance(learning_state, dict) else {}
@@ -1383,7 +1383,7 @@ def load_draftstars_players(csv_path: str, slot: str, learning_state: dict) -> L
         reader = csv.DictReader(handle)
         for raw in reader:
             status = str(raw.get("Playing Status", "")).upper()
-            if "OUT" in status or "QUESTIONABLE" in status:
+            if "OUT" in status or "QUESTIONABLE" in status or "DOUBTFUL" in status:
                 continue
 
             salary = int(safe_float(raw.get("Salary"), 0.0))
@@ -1419,7 +1419,7 @@ def load_draftstars_players(csv_path: str, slot: str, learning_state: dict) -> L
                 }
             )
 
-    return _draftstars_slot_filter(rows, slot)
+    return _draftstars_slot_filter(rows, slot), 100000
 
 
 
@@ -1628,7 +1628,7 @@ def build_best_lineup(
 
     salary_cap = DEFAULT_SALARY_CAP
     if draftstars_csv:
-        players = load_draftstars_players(draftstars_csv, slot, state)
+        players, salary_cap = load_draftstars_players(draftstars_csv, slot, state)
         format_name = "draftstars-classic"
     else:
         players, salary_cap = load_tank01_dfs_players(
