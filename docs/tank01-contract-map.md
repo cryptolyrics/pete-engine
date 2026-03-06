@@ -303,6 +303,29 @@
 }
 ```
 
+### Field Meanings (7-Day Rolling)
+| Field | What It Means |
+| ------------- | ------------------------------ |
+| fantasyPoints | Total FP scored in last 7 days |
+| pts | Total points in last 7 days |
+| reb | Total rebounds in last 7 days |
+| ast | Total assists in last 7 days |
+| stl | Total steals |
+| blk | Total blocks |
+| TOV | Total turnovers |
+
+### Use Cases
+- Compare 7-day form vs salary to find value
+- If player averaged 40 FP/week at $8K = 5 FP/$1K = great value
+- NOT a forward-looking projection — it's historical
+- Combine with opponent/game context for predictions
+
+### 445 Players Note
+- 445 = Active players with recent games (sample of league)
+- Not all NBA players (~540)
+- Only players with recent games (7-day window)
+- Missing players who haven't played recently
+
 ---
 
 ## Notes
