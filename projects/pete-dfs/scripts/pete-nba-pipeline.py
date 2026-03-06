@@ -23,9 +23,14 @@ import json
 import math
 import os
 import statistics
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9
+    ZoneInfo = None  # type: ignore
 
 import requests
 try:
@@ -35,7 +40,49 @@ except Exception:  # pragma: no cover - optional dependency
 
 WORKSPACE = Path(os.environ.get("OPENCLAW_WORKSPACE", str(Path.cwd() / ".pete-workspace")))
 LOG_DIR = WORKSPACE / "logs" / "Pete"
-TODAY = datetime.now().strftime("%Y-%m-%d")
+
+
+def get_usa_date() -> str:
+    """
+    Get the current USA Eastern Time date.
+    
+    NBA games are scheduled in US time, so all data collection and API calls
+    should use USA date (Eastern Time) rather than local Australia date.
+    
+    Australia (AEST/AEDT) is typically 14-15 hours ahead of US Eastern Time,
+    meaning when it's the next day in Australia, it's still the previous day in the US.
+    
+    Returns:
+        USA date in YYYY-MM-DD format (Eastern Time)
+    """
+    now_utc = datetime.now(timezone.utc)
+    
+    if ZoneInfo:
+        try:
+            usa_tz = ZoneInfo("America/New_York")
+            now_usa = now_utc.astimezone(usa_tz)
+            return now_usa.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    
+    # Fallback: manually calculate USA date (approximately -14 hours from AEST)
+    # This is a simplified calculation that works for most of the year
+    au_now = datetime.now()
+    usa_date = au_now - timedelta(hours=14)
+    # Handle edge case around midnight AU time
+    if au_now.hour < 14:  # Before 2pm AU time
+        usa_date = usa_date - timedelta(days=1)
+    return usa_date.strftime("%Y-%m-%d")
+
+
+# USA date for NBA data - this is the date that should be used for all Tank01/API calls
+# and for naming data files. Australia is always 1 day ahead of US NBA schedule.
+USA_TODAY = get_usa_date()
+# Keep TODAY for backwards compatibility but mark it as AU date
+AU_TODAY = datetime.now().strftime("%Y-%m-%d")
+# Default to USA date for NBA operations
+TODAY = USA_TODAY
+
 DEFAULT_SEASON = str(datetime.now().year)
 DEFAULT_SALARY_CAP = 50000  # Standard NBA DFS salary cap
 NBA_API_BASE_URL = os.environ.get("NBA_API_BASE_URL", "https://v2.nba.api-sports.io").rstrip("/")
@@ -3098,7 +3145,7 @@ Safety: Wagering is gated by PETE_ENABLE_WAGERING and quant_rules.json controls.
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pete NBA Daily Pipeline")
     parser.add_argument("--dry-run", action="store_true", help="Print report to stdout")
-    parser.add_argument("--date", default=TODAY, help="Date in YYYY-MM-DD")
+    parser.add_argument("--date", default=TODAY, help="Date in YYYY-MM-DD (USA Eastern Time - defaults to current USA date)")
     parser.add_argument("--season", default=DEFAULT_SEASON, help="Season start year (e.g., 2026)")
     parser.add_argument("--draftstars-csv", default="", help="Path to Draftstars player CSV")
     parser.add_argument("--slot", choices=["all", "early", "late"], default="all", help="Slate slot window")
