@@ -333,3 +333,158 @@
 - **Injury tags:** `out`, `doubtful`, `inactive`, `ruled out`, `suspended` (excluded).
 - **Fantasy points:** if `fantasyPoints` missing in projections, Pete derives FP from pts/reb/ast/stl/blk/tov weights.
 - **Snapshot files:** stored under `projects/pete-dfs/data-lake/nba/<category>/<YYYY-MM-DD>.json`.
+
+---
+
+# Additional Tank01 API Endpoints
+
+All endpoints use the same API key (`TANK01_RAPIDAPI_KEY` or `RAPIDAPI_KEY`).
+
+Base URL: `https://tank01-fantasy-stats.p.rapidapi.com`
+
+---
+
+## 9) `getNBABoxScore`
+**Purpose:** Individual game box score for a player
+
+### Endpoint
+```
+GET /getNBABoxScore?gameID=20240107_SA@CLE&fantasyPoints=true&pts=1&stl=3&blk=3&reb=1.25&ast=1.5&TOV=-1&mins=0&doubleDouble=0&tripleDouble=0&quadDouble=0
+```
+
+### Parameters
+- `gameID` (required): Game ID in format `YYYYMMDD_TEAM1@TEAM2`
+- `fantasyPoints`, `pts`, `stl`, `blk`, `reb`, `ast`, `TOV`, `mins`, `doubleDouble`, `tripleDouble`, `quadDouble` (optional): Stats to include
+
+---
+
+## 10) `getNBAGamesForPlayer`
+**Purpose:** Player's game history
+
+### Endpoint
+```
+GET /getNBAGamesForPlayer?playerID=28268405032&season=2024&fantasyPoints=true&pts=1&reb=1.25&stl=3&blk=3&ast=1.5&TOV=-1&mins=0&doubleDouble=0&tripleDouble=0&quadDouble=0
+```
+
+### Parameters
+- `playerID` (required): Tank01 player ID
+- `season` (required): Season year (e.g., 2024)
+
+---
+
+## 11) `getNBAGamesForDate`
+**Purpose:** All games on a specific date
+
+### Endpoint
+```
+GET /getNBAGamesForDate?gameDate=20240108
+```
+
+### Parameters
+- `gameDate` (required): Date in `YYYYMMDD` format
+
+---
+
+## 12) `getNBAGameInfo`
+**Purpose:** Game details by game ID
+
+### Endpoint
+```
+GET /getNBAGameInfo?gameID=20240107_SA@CLE
+```
+
+### Parameters
+- `gameID` (required): Game ID in format `YYYYMMDD_TEAM1@TEAM2`
+
+---
+
+## 13) `getNBATeamRoster`
+**Purpose:** Team roster with stats
+
+### Endpoint
+```
+GET /getNBATeamRoster?teamAbv=SAC&statsToGet=averages
+```
+
+### Parameters
+- `teamAbv` (required): Team abbreviation (e.g., SAC, LAL, BOS)
+- `statsToGet` (optional): `averages` or `totals`
+
+---
+
+## 14) `getNBAPlayerInfo`
+**Purpose:** Player information by name
+
+### Endpoint
+```
+GET /getNBAPlayerInfo?playerName=smith&statsToGet=averages
+```
+
+### Parameters
+- `playerName` (required): Player name (partial match supported)
+- `statsToGet` (optional): `averages` or `totals`
+
+---
+
+## 15) `getNBATeamSchedule`
+**Purpose:** Team's schedule for a season
+
+### Endpoint
+```
+GET /getNBATeamSchedule?teamAbv=DEN&season=2026
+```
+
+### Parameters
+- `teamAbv` (required): Team abbreviation
+- `season` (required): Season year
+
+---
+
+## 16) `getNBAADP`
+**Purpose:** Average Draft Position for DFS
+
+### Endpoint
+```
+GET /getNBAADP
+```
+
+---
+
+## 17) `getNBADepthCharts`
+**Purpose:** Team depth charts
+
+### Endpoint
+```
+GET /getNBADepthCharts
+```
+
+---
+
+## 18) `getNBANews`
+**Purpose:** Recent NBA news
+
+### Endpoint
+```
+GET /getNBANews?recentNews=true&maxItems=10
+```
+
+### Parameters
+- `recentNews` (optional): `true` for recent news
+- `maxItems` (optional): Number of items to return
+
+---
+
+## API Key Configuration
+
+Set via environment variable:
+```bash
+export TANK01_RAPIDAPI_KEY=your_key_here
+# or
+export RAPIDAPI_KEY=your_key_here
+```
+
+Base headers for all requests:
+```
+x-rapidapi-host: tank01-fantasy-stats.p.rapidapi.com
+x-rapidapi-key: YOUR_API_KEY
+```
